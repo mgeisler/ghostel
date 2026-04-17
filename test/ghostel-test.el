@@ -2426,6 +2426,28 @@ the caller's selected window or its `window-prev-buffers' history."
     ;; Default buffer name for `compilation-mode' is "*compilation*".
     (should (string-match-p "compilation" (nth 1 captured)))))
 
+(ert-deftest ghostel-test-compile-global-mode-falls-through-on-continue ()
+  "Non-nil CONTINUE must fall through: `--start' recreates the buffer."
+  (let ((orig-called nil)
+        (ghostel-called nil))
+    (cl-letf (((symbol-function 'ghostel-compile--start)
+               (lambda (&rest _) (setq ghostel-called t) nil)))
+      (ghostel-compile--compilation-start-advice
+       (lambda (&rest _) (setq orig-called t) nil)
+       "make" 'compilation-mode nil nil t))         ; continue=t
+    (should orig-called)
+    (should-not ghostel-called)))
+
+(ert-deftest ghostel-test-compile-global-mode-falls-through-on-comint ()
+  "MODE=t (comint) must fall through."
+  (let ((orig-called nil))
+    (cl-letf (((symbol-function 'ghostel-compile--start)
+               (lambda (&rest _) (error "should not run"))))
+      (ghostel-compile--compilation-start-advice
+       (lambda (&rest _) (setq orig-called t) nil)
+       "make" t nil nil nil))
+    (should orig-called)))
+
 (ert-deftest ghostel-test-compile-global-mode-excluded-custom-mode ()
   "A custom mode added to `ghostel-compile-global-mode-excluded-modes' falls through."
   (let ((orig-called nil)
@@ -5330,6 +5352,8 @@ while :; do sleep 0.1; done'\n")
     ghostel-test-compile-global-mode-toggles-advice
     ghostel-test-compile-global-mode-falls-through-for-grep
     ghostel-test-compile-global-mode-routes-to-ghostel-start
+    ghostel-test-compile-global-mode-falls-through-on-continue
+    ghostel-test-compile-global-mode-falls-through-on-comint
     ghostel-test-compile-global-mode-excluded-custom-mode
     ghostel-test-compile-multiline-command-via-sh
     ghostel-test-viewport-start-skips-trailing-newline

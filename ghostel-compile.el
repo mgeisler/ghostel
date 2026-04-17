@@ -89,6 +89,21 @@ interactive terminal."
 Useful for diagnosing wrong exit codes or missed events."
   :type 'boolean)
 
+;; Removed customs kept as obsolete so users' old `setq' forms in init
+;; don't signal `void-variable'.  Both were tied to the old "type the
+;; command into a live shell" design and no longer mean anything.
+(defvar ghostel-compile-hide-prompts nil
+  "Obsolete no-op kept so users' old `setq' forms don't error.
+Had no effect since `ghostel-compile' no longer runs an interactive
+shell; there are no surrounding prompts to hide.")
+(make-obsolete-variable 'ghostel-compile-hide-prompts nil "0.16.0")
+
+(defvar ghostel-compile-clear-buffer nil
+  "Obsolete no-op kept so users' old `setq' forms don't error.
+Had no effect since `ghostel-compile' now recreates the compile
+buffer from scratch on every run.")
+(make-obsolete-variable 'ghostel-compile-clear-buffer nil "0.16.0")
+
 (defcustom ghostel-compile-finish-functions nil
   "Functions to call when a `ghostel-compile' command finishes.
 Each function receives two arguments: the compilation buffer and a
@@ -412,12 +427,11 @@ same as in any compilation buffer."
             (compilation--update-in-progress-mode-line))
           (ghostel-compile--finalize buffer exit (current-time)))))))
 
-(defun ghostel-compile--stty-flags ()
-  "Return the `stty' flags used to initialize the compile PTY.
-Matches what `ghostel--spawn-pty' uses for generic (non-shell)
-programs, but with `echo' off so we don't render an echo of the
-command (which users already see in the header)."
-  "erase '^?' iutf8 -ixon -echo")
+(defconst ghostel-compile--stty-flags "erase '^?' iutf8 -ixon -echo"
+  "`stty' flags for the compile PTY.
+Matches `ghostel--spawn-pty's flags for non-shell programs, with
+`echo' off so we don't render an echoed copy of the command (which
+users already see in the header).")
 
 (defun ghostel-compile--spawn (command buffer height width)
   "Spawn COMMAND in BUFFER via a PTY sized HEIGHT rows by WIDTH columns.
@@ -434,7 +448,7 @@ exec'ing the user's shell."
          (wrapper
           (list "/bin/sh" "-c"
                 (concat
-                 "stty " (ghostel-compile--stty-flags)
+                 "stty " ghostel-compile--stty-flags
                  (format " rows %d columns %d" height width)
                  " 2>/dev/null; "
                  "exec "
@@ -468,10 +482,19 @@ exec'ing the user's shell."
 
 ;;; Buffer management
 
+(defconst ghostel-compile--managed-buffer-sentinel :ghostel-compile
+  "Sentinel value used for `ghostel--managed-buffer-name' in compile buffers.
+When set, `ghostel--set-title' (OSC 2) skips auto-renaming the buffer — we
+don't want a compile command's title sequence to replace our fixed name.")
+
 (defun ghostel-compile--prepare-buffer (name dir)
   "Return a fresh ghostel buffer named NAME rooted at DIR.
 If a buffer with NAME already exists, kill it (after interrupting
-any running process) so each run starts clean."
+any running process) so each run starts clean.
+
+Creates the terminal directly — no interactive shell is spawned —
+so there is no remote-integration round-trip on TRAMP buffers and
+no shell to tear down."
   (let ((existing (get-buffer name)))
     (when existing
       (with-current-buffer existing
@@ -494,32 +517,24 @@ any running process) so each run starts clean."
       (let ((kill-buffer-query-functions nil))
         (kill-buffer existing))))
   (ghostel--load-module t)
-  (let ((buffer (get-buffer-create name)))
+  (let* ((buffer (get-buffer-create name))
+         (win (or (get-buffer-window buffer t) (selected-window)))
+         (height (if (window-live-p win) (window-body-height win) 24))
+         (width  (if (window-live-p win) (window-max-chars-per-line win) 80)))
     (with-current-buffer buffer
-      (setq-local default-directory dir))
-    (ghostel--init-buffer buffer)
-    ;; `ghostel--init-buffer' starts a shell — we don't want one.  Tear it
-    ;; down so the compile spawn can attach a fresh process to the same
-    ;; ghostel renderer.
-    (with-current-buffer buffer
-      (when (and (bound-and-true-p ghostel--process)
-                 (process-live-p ghostel--process))
-        (set-process-sentinel ghostel--process #'ignore)
-        (set-process-filter ghostel--process #'ignore)
-        (set-process-query-on-exit-flag ghostel--process nil)
-        (delete-process ghostel--process)
-        (setq ghostel--process nil))
-      (let ((inhibit-read-only t))
-        (erase-buffer))
-      ;; The init-started shell produced no output yet (we killed it
-      ;; before it wrote anything), but reset any pending bytes anyway.
-      (setq ghostel--pending-output nil)
-      (when (bound-and-true-p ghostel--redraw-timer)
-        (cancel-timer ghostel--redraw-timer)
-        (setq ghostel--redraw-timer nil))
-      (when (bound-and-true-p ghostel--input-timer)
-        (cancel-timer ghostel--input-timer)
-        (setq ghostel--input-timer nil)))
+      (setq-local default-directory dir)
+      (unless (derived-mode-p 'ghostel-mode)
+        (ghostel-mode))
+      ;; Pin the buffer name so a compile command's OSC 2 title sequence
+      ;; can't rename the buffer mid-run.  `ghostel--set-title' only
+      ;; renames when `ghostel--managed-buffer-name' equals the current
+      ;; buffer name (see ghostel.el); a sentinel that can never match
+      ;; disables auto-renaming.
+      (setq ghostel--managed-buffer-name
+            ghostel-compile--managed-buffer-sentinel)
+      (setq ghostel--term (ghostel--new height width ghostel-max-scrollback))
+      (setq ghostel--term-rows height)
+      (ghostel--apply-palette ghostel--term))
     buffer))
 
 
@@ -676,14 +691,21 @@ opt a specific caller out."
     (orig-fn command &optional mode name-function highlight-regexp continue)
   "Around advice for `compilation-start': route COMMAND through ghostel.
 Falls back to ORIG-FN (with COMMAND, MODE, NAME-FUNCTION,
-HIGHLIGHT-REGEXP, CONTINUE unchanged) when MODE is in
-`ghostel-compile-global-mode-excluded-modes', or when MODE is t
-\(which asks for a comint buffer — not supported).  Otherwise
-routes COMMAND through `ghostel-compile--start', honouring
+HIGHLIGHT-REGEXP, CONTINUE unchanged) when:
+
+- MODE is t — `compilation-start' asks for a comint buffer, which
+  we don't emulate.
+- MODE is in `ghostel-compile-global-mode-excluded-modes' — e.g.
+  `grep-mode' by default.
+- CONTINUE is non-nil — the caller wants to append to an existing
+  compilation buffer; each `ghostel-compile' run replaces its
+  buffer from scratch, so we can't honour that.
+
+Otherwise routes COMMAND through `ghostel-compile--start', honouring
 NAME-FUNCTION for the buffer name and HIGHLIGHT-REGEXP for error
-highlighting.  CONTINUE is accepted but not supported — the
-buffer is always replaced on each run."
+highlighting."
   (if (or (eq mode t)
+          continue
           (memq mode ghostel-compile-global-mode-excluded-modes))
       (funcall orig-fn command mode name-function highlight-regexp continue)
     (let* ((actual-mode (or mode 'compilation-mode))
